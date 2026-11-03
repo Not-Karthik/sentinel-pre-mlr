@@ -30,6 +30,14 @@ from fastapi import FastAPI, HTTPException, Request, encoders, responses
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
 from app.app_utils import services
+from app.app_utils.resume import (
+    failure_event,
+    resume_stream_query,
+    with_auto_resume,
+)
+
+RESUME_METHOD = "resume_stream_query"
+AUTO_RESUME_METHODS = {"async_stream_query", "stream_query"}
 
 
 def _no_op_instrumentor_builder(project_id: str) -> None:
@@ -76,27 +84,68 @@ def attach_reasoning_engine_routes(app: FastAPI) -> None:
             )
         return getattr(rt, class_method)
 
+    async def stream_json(request: Request, events, kwargs: dict):
+        user_id = kwargs.get("user_id")
+        session_id = kwargs.get("session_id")
+        try:
+            async for event in events:
+                yield json.dumps(encoders.jsonable_encoder(event)) + "\n"
+        except Exception as exc:
+            if not (user_id and session_id):
+                raise
+            failure = await failure_event(
+                request.app.state.runner, user_id, session_id, exc
+            )
+            yield json.dumps(failure) + "\n"
+
     @app.post("/api/stream_reasoning_engine")
     async def stream_query(request: Request) -> responses.StreamingResponse:
         body = await request.json()
-        method = resolve_method(body["class_method"], streaming=True)
         kwargs = body.get("input") or {}
+        if body["class_method"] == RESUME_METHOD:
+            if not (kwargs.get("user_id") and kwargs.get("session_id")):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{RESUME_METHOD} requires user_id and session_id",
+                )
+            runner = request.app.state.runner
+            return responses.StreamingResponse(
+                content=stream_json(
+                    request,
+                    with_auto_resume(
+                        runner,
+                        resume_stream_query(runner, **kwargs),
+                        user_id=kwargs["user_id"],
+                        session_id=kwargs["session_id"],
+                    ),
+                    kwargs,
+                ),
+                media_type="application/json",
+            )
+        method = resolve_method(body["class_method"], streaming=True)
         stream = (
             await method(**kwargs)
             if inspect.iscoroutinefunction(method)
             else method(**kwargs)
         )
-
-        async def generator():
-            if hasattr(stream, "__aiter__"):
-                async for event in stream:
-                    yield json.dumps(encoders.jsonable_encoder(event)) + "\n"
-            else:
-                async for event in iterate_in_threadpool(stream):
-                    yield json.dumps(encoders.jsonable_encoder(event)) + "\n"
+        events = (
+            stream if hasattr(stream, "__aiter__") else iterate_in_threadpool(stream)
+        )
+        if (
+            body["class_method"] in AUTO_RESUME_METHODS
+            and kwargs.get("user_id")
+            and kwargs.get("session_id")
+        ):
+            events = with_auto_resume(
+                request.app.state.runner,
+                events,
+                user_id=kwargs["user_id"],
+                session_id=kwargs["session_id"],
+            )
 
         return responses.StreamingResponse(
-            content=generator(), media_type="application/json"
+            content=stream_json(request, events, kwargs),
+            media_type="application/json",
         )
 
     @app.post("/api/reasoning_engine")

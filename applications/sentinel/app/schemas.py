@@ -294,6 +294,16 @@ class Finding(BaseModel):
         description="Possible remediation paths, presented as options not mandates.",
     )
     location: ContentLocation | None = None
+    citations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Rules from the user-supplied rules file that this finding relates "
+            "to, each copied verbatim as written in that file (with its section "
+            "heading in parentheses, if it has one). Only cite text that is in "
+            "the supplied rules file; never cite standard MLR guidance here. "
+            "Empty when no rules file was supplied or no rule applies."
+        ),
+    )
 
 
 class ReviewerOutput(BaseModel):

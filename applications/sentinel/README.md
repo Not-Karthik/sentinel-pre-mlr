@@ -249,6 +249,19 @@ This automated pipeline:
 
 ---
 
+## Retry & Resume
+
+Sentinel recovers an interrupted query from the events persisted in the session instead of starting it over. This needs a persistent session service (`VertexAiSessionService` or a `SESSION_SERVICE_URI` database); with `InMemorySessionService` there is nothing to resume from.
+
+- **Node retry:** every `LlmAgent` node retries up to `NODE_RETRY_ATTEMPTS` (default 3) on top of the HTTP-level `MODEL_RETRY_*` retries.
+- **Replay-based resume:** the app does not enable `ResumabilityConfig`, which would add a status-snapshot event after every node change. On resume the workflow replays the node outputs already saved in the session and re-runs only the unfinished nodes. An invocation counts as finished once a terminal node of the graph (`synthesizer` or `direct_responder`) has written its output. A node that was in flight when the process died runs again from its start (at-least-once).
+- **Resume call:** `POST /api/stream_reasoning_engine` with `{"class_method": "resume_stream_query", "input": {"user_id": "...", "session_id": "..."}}`. `invocation_id` is optional and defaults to the latest unfinished invocation. It returns an empty stream if that invocation already finished.
+- **Server-side auto-resume:** when a query with a `user_id` and `session_id` fails while the container is alive, the server resumes it inside the same stream, up to `AUTO_RESUME_MAX` times (default 3, `0` disables) with backoff from `AUTO_RESUME_INITIAL_DELAY` to `AUTO_RESUME_MAX_DELAY`.
+- **When resumes run out:** the stream ends with a final JSON line `{"error_code", "error_message", "resumable", "invocation_id", "session_id", "user_id"}`. If `resumable` is true, a UI Retry button should call `resume_stream_query` with the same `user_id` and `session_id`. That call gets a fresh automatic-resume budget. If `resumable` is false, nothing was saved, so re-send the original query.
+- **Automatic retry (client side):** `app/app_utils/resilient_client.py` (`stream_query_with_resume`) sends the query and, on a dropped stream or an error event, resumes the same session with exponential backoff up to `max_resumes`.
+
+Long-running tasks (`:asyncQuery` with GCS input and output) are not covered yet.
+
 ## A2A (Agent-to-Agent) Integration & Multi-Agent Workflows
 
 Sentinel is designed as a standalone compliance agent and as a **downstream A2A service** for other agents and composite workflows.
@@ -554,3 +567,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 Apache 2.0 — see the LICENSE file in the repository root.
+
+
+uv run adk web app --session_service_uri="agentengine://projects/pre-mlr/locations/us-central1/reasoningEngines/6707271892962639872" 

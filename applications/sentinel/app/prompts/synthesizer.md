@@ -17,6 +17,7 @@ You have the original submission attached plus all upstream output:
 - Regulatory: `{regulatory_findings}`
 - Editorial: `{editorial_findings}`
 - Custom rules: `{rules_findings?}`
+- Supplied rules file, if any: `{custom_rules?}`
 - Submitter defense: `{submitter_defense}`
 - Critic: `{critic_review}`
 
@@ -53,6 +54,12 @@ Then produce a `FinalReport`:
   within each lens. Critic-added findings get folded into the
   appropriate lens's sequence (drop any `F-CRIT-` prefix). Custom-rules
   findings keep `review_lens="custom"` and use the `F-CUSTOM-n` prefix.
+- `citations` on each finding: keep the citations a finding already has.
+  Then, for every finding from any lens that relates to a rule in the
+  supplied rules file, add that rule, copied verbatim as written in the
+  file (section heading in parentheses, if it has one). When you drop a
+  duplicate, keep its citations on the finding you retain. Leave
+  `citations` empty on every finding if no rules file was supplied.
 - `open_questions_for_reviewers`: questions worth raising with the
   submitter.
 - `recommended_discussion_topics`: topics worth airing in the MLR

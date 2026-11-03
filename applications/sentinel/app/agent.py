@@ -69,7 +69,7 @@ from google.adk.agents.context import Context
 from google.adk.apps import App
 from google.adk.events.event import Event
 from google.adk.models.google_llm import Gemini
-from google.adk.workflow import START, JoinNode, Workflow
+from google.adk.workflow import START, JoinNode, RetryConfig, Workflow
 from google.genai import types
 
 from app import prompts
@@ -99,6 +99,14 @@ _MODEL_RETRY_OPTIONS = types.HttpRetryOptions(
     exp_base=float(os.getenv("MODEL_RETRY_EXP_BASE", "2.0")),
     jitter=float(os.getenv("MODEL_RETRY_JITTER", "1.0")),
     http_status_codes=[408, 429, 500, 502, 503, 504],
+)
+
+# Node-level retry for failures that outlive the HTTP-level retries above
+# (e.g. a structured-output parse error). Applied to every LlmAgent node.
+_NODE_RETRY_CONFIG = RetryConfig(
+    max_attempts=int(os.getenv("NODE_RETRY_ATTEMPTS", "3")),
+    initial_delay=float(os.getenv("NODE_RETRY_INITIAL_DELAY", "1.0")),
+    max_delay=float(os.getenv("NODE_RETRY_MAX_DELAY", "60.0")),
 )
 
 # All sub-agents share the same model configured with automatic retries.
@@ -153,6 +161,7 @@ intake_agent = LlmAgent(
     name="intake",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Catalogues every reviewable element in the submitted content "
         "into a structured inventory."
@@ -221,6 +230,7 @@ direct_responder = LlmAgent(
     name="direct_responder",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Provides a direct, helpful response to non-promotional inquiries, "
         "general questions, or greetings without running the full MLR review pipeline."
@@ -237,6 +247,7 @@ medical_reviewer = LlmAgent(
     name="medical_reviewer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Reviews the submission through a clinical lens: accuracy, dosing, "
         "mechanism, efficacy, safety, fair balance."
@@ -251,6 +262,7 @@ legal_reviewer = LlmAgent(
     name="legal_reviewer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Reviews the submission through a legal lens: claim substantiation, "
         "comparative claims, citations, disclosures, IP."
@@ -265,6 +277,7 @@ regulatory_reviewer = LlmAgent(
     name="regulatory_reviewer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Reviews the submission through a regulatory lens: indication scope, "
         "off-label, ISI, PI consistency, fair balance."
@@ -279,6 +292,7 @@ editorial_reviewer = LlmAgent(
     name="editorial_reviewer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Reviews the submission through an editorial lens: clarity, "
         "accessibility, tone, visual design, typography."
@@ -293,6 +307,7 @@ submitter_advocate = LlmAgent(
     name="submitter_advocate",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Argues for the submission. Produces a defense brief the critic "
         "panel weighs when calibrating severity."
@@ -307,6 +322,7 @@ rules_reviewer = LlmAgent(
     name="rules_reviewer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Reviews the submission against a user-supplied rules file (brand "
         "voice, internal SOPs, market-specific restrictions, etc.). Emits "
@@ -345,6 +361,7 @@ dedupe_critic = LlmAgent(
     name="dedupe_critic",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Identifies duplicate findings across lenses and surfaces cross-lens themes."
     ),
@@ -358,6 +375,7 @@ severity_critic = LlmAgent(
     name="severity_critic",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Calibrates severity and confidence on reviewer findings, weighing "
         "the submitter's defense brief."
@@ -372,6 +390,7 @@ gap_critic = LlmAgent(
     name="gap_critic",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Surfaces issues the reviewer panel missed and proposes net-new "
         "findings to fill the gaps."
@@ -394,6 +413,7 @@ critic_merger = LlmAgent(
     name="critic_merger",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Consolidates the three specialist critic outputs into a single "
         "CriticAssessment for the synthesizer, and recommends whether the "
@@ -440,6 +460,7 @@ synthesizer_agent = LlmAgent(
     name="synthesizer",
     model=_MODEL,
     generate_content_config=_GENERATE_CONFIG,
+    retry_config=_NODE_RETRY_CONFIG,
     description=(
         "Produces the final consolidated MLR-style report from intake, "
         "reviewers, advocate, and critic outputs."
