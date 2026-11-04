@@ -81,6 +81,7 @@ def test_sentinel_terminal_nodes_mark_completion() -> None:
     assert _terminal_node_names(sentinel_app.root_agent) == {
         "synthesizer",
         "direct_responder",
+        "finalize_video_report",
     }
 
 

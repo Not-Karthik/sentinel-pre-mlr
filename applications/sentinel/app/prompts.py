@@ -55,3 +55,6 @@ LOOP_DECIDER = load("loop_decider")
 DIRECT_RESPONDER = load("direct_responder")
 
 SYNTHESIZER = load("synthesizer")
+
+# Video review (single call, video input)
+VIDEO_REVIEWER = load("video_reviewer")

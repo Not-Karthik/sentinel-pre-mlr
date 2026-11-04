@@ -61,6 +61,8 @@ Run from the parent directory with::
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from typing import Any
 
@@ -72,7 +74,13 @@ from google.adk.models.google_llm import Gemini
 from google.adk.workflow import START, JoinNode, RetryConfig, Workflow
 from google.genai import types
 
+from pydantic import ValidationError
+
 from app import prompts
+from app.app_utils import media
+from app.app_utils.media import MediaInputPlugin
+from app.app_utils.usage import UsageLoggingPlugin
+from app.app_utils.video_report import finalize_report
 from app.schemas import (
     ContentInventory,
     CriticAssessment,
@@ -82,7 +90,10 @@ from app.schemas import (
     ReviewerOutput,
     SeverityCriticOutput,
     SubmitterDefenseBrief,
+    VideoReport,
 )
+
+logger = logging.getLogger(__name__)
 
 # Pin the model endpoint region before any ADK / genai client is constructed.
 # _MODEL defaults to a global-endpoint model, so without this the agent 404s on
@@ -119,6 +130,11 @@ _MODEL = Gemini(
 # truncated mid-finding on dense submissions. 65535 is the upper bound the
 # Gemini API accepts; the model will return whatever it actually produces.
 _GENERATE_CONFIG = types.GenerateContentConfig(max_output_tokens=65535)
+
+# Video review sampling: frames per second and per-frame token budget. Read once
+# at import, like the other tunables above (invalid values fall back to defaults).
+_VIDEO_FPS = media.get_video_fps()
+_VIDEO_MEDIA_RESOLUTION = media.get_media_resolution()
 
 # Hard cap on review iterations. Each iteration runs the full reviewer
 # panel + critic panel + merger, so the cost budget per cap
@@ -472,6 +488,77 @@ synthesizer_agent = LlmAgent(
 
 
 # ---------------------------------------------------------------------------
+# Video review (single call, no panel)
+# ---------------------------------------------------------------------------
+
+
+def route_media(ctx: Context, node_input: Any) -> Event:
+    """Routes video submissions to the video review and everything else to the
+    existing MLR flow.
+
+    Emits a route only (no output) so that neither branch receives the media a
+    second time: the user message already carries it.
+    """
+    if media.has_video(node_input):
+        return Event(route="video")  # ty: ignore[pydantic-discarded-extra-argument]
+    return Event(route="mlr_review")  # ty: ignore[pydantic-discarded-extra-argument]
+
+
+video_reviewer = LlmAgent(
+    name="video_reviewer",
+    model=_MODEL,
+    generate_content_config=types.GenerateContentConfig(
+        max_output_tokens=65535,
+        media_resolution=_VIDEO_MEDIA_RESOLUTION,
+    ),
+    retry_config=_NODE_RETRY_CONFIG,
+    description=(
+        "Reviews a video in one pass and returns timestamped findings with "
+        "a bounding box for anything visible on screen."
+    ),
+    instruction=prompts.VIDEO_REVIEWER,
+    output_schema=VideoReport,
+    output_key="video_report",
+)
+
+
+def finalize_video_report(ctx: Context, node_input: Any) -> Event:
+    """Validates bboxes and timestamps and emits the final video report."""
+    raw = ctx.state.get("video_report")
+    if raw is None:
+        raw = node_input
+    try:
+        report = VideoReport.model_validate(raw)
+    except (ValidationError, TypeError, ValueError) as exc:
+        logger.error("Video review produced no valid report: %s", exc)
+        error = {"error": "The video review did not produce a valid report."}
+        return Event(
+            output=error,
+            content=types.Content(
+                role="model", parts=[types.Part(text=json.dumps(error))]
+            ),
+        )
+
+    report, stats = finalize_report(report)
+    if stats.bboxes_dropped or stats.bboxes_rescaled or stats.time_ranges_swapped:
+        logger.warning(
+            "Video report adjusted: bboxes_dropped=%d bboxes_rescaled=%d "
+            "time_ranges_swapped=%d",
+            stats.bboxes_dropped,
+            stats.bboxes_rescaled,
+            stats.time_ranges_swapped,
+        )
+    payload = report.model_dump(mode="json", exclude_none=True)
+    return Event(
+        output=payload,
+        content=types.Content(
+            role="model",
+            parts=[types.Part(text=json.dumps(payload, ensure_ascii=False, indent=2))],
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Root pipeline (Workflow DAG)
 # ---------------------------------------------------------------------------
 
@@ -482,10 +569,14 @@ root_agent = Workflow(
         "content. Catalogues the submission, runs an iterative review loop "
         "(four critical lenses + a submitter advocate + a custom-rules "
         "reviewer, with a three-way critic panel) and synthesises a "
-        "discussion-oriented report aimed at the brand team."
+        "discussion-oriented report aimed at the brand team. Video "
+        "submissions take a single-call review with timestamped, "
+        "bbox-annotated findings."
     ),
     edges=[
-        (START, _load_custom_rules),
+        (START, route_media),
+        (route_media, {"mlr_review": _load_custom_rules, "video": video_reviewer}),
+        (video_reviewer, finalize_video_report),
         (_load_custom_rules, intake_agent),
         (intake_agent, decide_intake_route),
         (
@@ -504,4 +595,8 @@ root_agent = Workflow(
     ],
 )
 
-app = App(root_agent=root_agent, name="app")
+app = App(
+    root_agent=root_agent,
+    name="app",
+    plugins=[MediaInputPlugin(), UsageLoggingPlugin()],
+)

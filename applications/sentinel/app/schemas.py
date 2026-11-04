@@ -527,3 +527,72 @@ class FinalReport(BaseModel):
     recommended_discussion_topics: list[str] = Field(default_factory=list)
     counts_by_lens: dict[str, int] = Field(default_factory=dict)
     counts_by_severity: dict[str, int] = Field(default_factory=dict)
+
+
+class VideoIssueCategory(StrEnum):
+    """Categories used by the single-call video review."""
+
+    MEDICAL_ACCURACY = "medical_accuracy"
+    CITATION_MISSING = "citation_missing"
+    MISLEADING_CLAIM = "misleading_claim"
+    OUTDATED_INFORMATION = "outdated_information"
+    UNVERIFIED_STATEMENT = "unverified_statement"
+    CONTRAINDICATION = "contraindication"
+    DOSAGE_CONCERN = "dosage_concern"
+    PRESENTATION_STYLE = "presentation_style"
+    WORDING_CONCERN = "wording_concern"
+    VISUAL_QUALITY = "visual_quality"
+    AUDIO_QUALITY = "audio_quality"
+    ACCESSIBILITY = "accessibility"
+    PROFESSIONALISM = "professionalism"
+    OTHER = "other"
+
+
+class VideoFinding(BaseModel):
+    """A single issue found in a video, with its time range and screen region."""
+
+    finding_id: str = Field(..., description="Stable ID, e.g. 'V-1'.")
+    category: VideoIssueCategory
+    severity: Severity
+    observation: str = Field(
+        ...,
+        min_length=10,
+        description="Detailed explanation of the issue.",
+    )
+    quoted_content: str | None = Field(
+        None,
+        description="Verbatim narration or on-screen text, or a short description.",
+    )
+    start_timestamp: str = Field(
+        ...,
+        description=(
+            "First moment the issue is clearly visible or audible (MM:SS, "
+            "optionally with one decimal such as 00:02.5, or HH:MM:SS)."
+        ),
+    )
+    end_timestamp: str = Field(
+        ...,
+        description="End of the issue in the video (same format as start_timestamp).",
+    )
+    location: ContentLocation | None = Field(
+        None,
+        description=(
+            "Where the issue appears on screen: `bbox` is normalized "
+            "[x_min, y_min, x_max, y_max] in 0..1 for the frame at "
+            "`start_timestamp`. Null for issues with no place in the frame."
+        ),
+    )
+
+
+class VideoReport(BaseModel):
+    """Output of the video review: a summary and the findings in time order."""
+
+    content_summary: str = Field(
+        ...,
+        description="2-4 sentence neutral summary of what the video shows and says.",
+    )
+    findings: list[VideoFinding] = Field(default_factory=list)
+    counts_by_severity: dict[str, int] = Field(
+        default_factory=dict,
+        description="Number of findings per severity; filled in after the review.",
+    )
