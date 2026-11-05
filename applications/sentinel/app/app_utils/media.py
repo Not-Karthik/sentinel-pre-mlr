@@ -34,8 +34,8 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_FPS = (0.5, 1.0, 2.0)
-DEFAULT_FPS = 1.0
+ALLOWED_FPS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+DEFAULT_FPS = 4.0
 MAX_MEDIA_PER_MESSAGE = 10
 
 VIDEO_MIME_BY_EXT = {
@@ -63,8 +63,16 @@ _GCS_RE = re.compile(r"gs://[^\s\"'<>]+")
 _TRAILING_PUNCTUATION = ".,;:!?)]}"
 
 
+def env_flag(name: str, default: bool) -> bool:
+    """Read a boolean environment variable (1/true/yes/on), with a default."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_video_fps(raw: str | None = None) -> float:
-    """Return the configured video sampling rate (``VIDEO_FPS``), default 1."""
+    """Return the configured video sampling rate (``VIDEO_FPS``), default 4."""
     raw = os.getenv("VIDEO_FPS") if raw is None else raw
     if raw is None or not raw.strip():
         return DEFAULT_FPS
@@ -162,6 +170,32 @@ def has_video(content: types.Content | None) -> bool:
     if content is None:
         return False
     return any(is_video_part(part) for part in content.parts or [])
+
+
+def sampling_fps(events) -> float | None:
+    """Return the sampling rate set on the newest user-supplied video, if any."""
+    for event in reversed(list(events)):
+        if getattr(event, "author", None) != "user" or not event.content:
+            continue
+        for part in event.content.parts or []:
+            if is_video_part(part) and part.video_metadata and part.video_metadata.fps:
+                return float(part.video_metadata.fps)
+    return None
+
+
+def sampling_note(fps: float) -> str:
+    """Tell the model how far apart the sampled frames are."""
+    step = 1 / fps
+    frames = "frame" if fps == 1 else "frames"
+    seconds = "second" if step == 1 else "seconds"
+    return (
+        "## Sampling\n\n"
+        f"The video was sampled at {fps:g} {frames} per second, so the frames you "
+        f"can see are {step:g} {seconds} apart. Report timestamps that match a "
+        f"sampled frame (a multiple of {step:g} {seconds} from the start of the "
+        "video); when an item first becomes clearly visible between two sampled "
+        "frames, use the later frame."
+    )
 
 
 def _strip_trailing_punctuation(url: str) -> str:

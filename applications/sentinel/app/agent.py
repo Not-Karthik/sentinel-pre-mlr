@@ -64,10 +64,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.apps import App
 from google.adk.events.event import Event
 from google.adk.models.google_llm import Gemini
@@ -77,7 +79,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 from app import prompts
-from app.app_utils import media
+from app.app_utils import bbox_refine, frames, media
 from app.app_utils.media import MediaInputPlugin
 from app.app_utils.usage import UsageLoggingPlugin
 from app.app_utils.video_report import finalize_report
@@ -131,9 +133,9 @@ _MODEL = Gemini(
 # Gemini API accepts; the model will return whatever it actually produces.
 _GENERATE_CONFIG = types.GenerateContentConfig(max_output_tokens=65535)
 
-# Video review sampling: frames per second and per-frame token budget. Read once
-# at import, like the other tunables above (invalid values fall back to defaults).
-_VIDEO_FPS = media.get_video_fps()
+# Video review frame detail, read once at import (an invalid value falls back to
+# the default). The sampling rate, VIDEO_FPS, is applied per message by
+# MediaInputPlugin.
 _VIDEO_MEDIA_RESOLUTION = media.get_media_resolution()
 
 # Hard cap on review iterations. Each iteration runs the full reviewer
@@ -504,6 +506,12 @@ def route_media(ctx: Context, node_input: Any) -> Event:
     return Event(route="mlr_review")  # ty: ignore[pydantic-discarded-extra-argument]
 
 
+def _video_instruction(ctx: ReadonlyContext) -> str:
+    """Video review prompt plus the sampling rate actually used for this message."""
+    fps = media.sampling_fps(ctx.session.events) or media.get_video_fps()
+    return f"{prompts.VIDEO_REVIEWER}\n\n{media.sampling_note(fps)}"
+
+
 video_reviewer = LlmAgent(
     name="video_reviewer",
     model=_MODEL,
@@ -516,10 +524,77 @@ video_reviewer = LlmAgent(
         "Reviews a video in one pass and returns timestamped findings with "
         "a bounding box for anything visible on screen."
     ),
-    instruction=prompts.VIDEO_REVIEWER,
+    instruction=_video_instruction,
     output_schema=VideoReport,
     output_key="video_report",
 )
+
+
+async def refine_video_boxes(ctx: Context, node_input: Any) -> Event:
+    """Re-boxes the findings on still frames cut from the video with ffmpeg.
+
+    Needs a video this process can read (a ``gs://`` object or an attached
+    file). Any problem leaves the video review's own boxes in place.
+    """
+    raw = ctx.state.get("video_report")
+    if raw is None:
+        raw = node_input
+    if not media.env_flag("VIDEO_BBOX_REFINE", True):
+        return Event(output=raw)
+
+    workdir = None
+    started = time.perf_counter()
+    try:
+        report = VideoReport.model_validate(raw)
+        source = frames.find_video_source(ctx.session.events)
+        ffmpeg = frames.ffmpeg_executable()
+        if source is None or ffmpeg is None:
+            logger.info(
+                "Box refinement skipped: readable video=%s ffmpeg=%s",
+                source is not None,
+                ffmpeg is not None,
+            )
+            return Event(output=raw)
+
+        workdir = frames.make_workdir()
+        video_path = await frames.materialize(
+            source,
+            workdir,
+            bucket=os.getenv("GCS_BUCKET_NAME"),
+            folder=os.getenv("GCS_MEDIA_FOLDER", "dev"),
+        )
+        refined, stats = await bbox_refine.refine_report(
+            report,
+            extract_frame=lambda seconds: frames.extract_frame(
+                ffmpeg, video_path, seconds
+            ),
+            generate_boxes=bbox_refine.make_generate_boxes(
+                _MODEL.api_client, _MODEL.model
+            ),
+            concurrency=int(os.getenv("VIDEO_REFINE_CONCURRENCY", "3")),
+        )
+        logger.info(
+            "Box refinement: findings=%d frames=%d calls=%d refined=%d shifted=%d "
+            "kept_original=%d prompt_tokens=%d output_tokens=%d elapsed_s=%.1f",
+            stats.findings,
+            stats.frames,
+            stats.calls,
+            stats.refined,
+            stats.shifted,
+            stats.kept_original,
+            stats.prompt_tokens,
+            stats.output_tokens,
+            time.perf_counter() - started,
+        )
+        payload = refined.model_dump(mode="json")
+        ctx.state["video_report"] = payload
+        return Event(output=payload)
+    except Exception as exc:
+        logger.warning("Box refinement skipped after an error: %s", exc)
+        return Event(output=raw)
+    finally:
+        if workdir is not None:
+            frames.remove_workdir(workdir)
 
 
 def finalize_video_report(ctx: Context, node_input: Any) -> Event:
@@ -576,7 +651,8 @@ root_agent = Workflow(
     edges=[
         (START, route_media),
         (route_media, {"mlr_review": _load_custom_rules, "video": video_reviewer}),
-        (video_reviewer, finalize_video_report),
+        (video_reviewer, refine_video_boxes),
+        (refine_video_boxes, finalize_video_report),
         (_load_custom_rules, intake_agent),
         (intake_agent, decide_intake_route),
         (

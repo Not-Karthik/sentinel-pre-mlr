@@ -41,11 +41,13 @@ def _normalize(content: types.Content, fps: float = 1.0) -> types.Content | None
 
 
 def test_get_video_fps_defaults_and_validates() -> None:
-    assert media.get_video_fps("") == 1.0
+    assert media.get_video_fps("") == 4.0
     assert media.get_video_fps("0.5") == 0.5
     assert media.get_video_fps("2") == 2.0
-    assert media.get_video_fps("3") == 1.0
-    assert media.get_video_fps("fast") == 1.0
+    assert media.get_video_fps("4") == 4.0
+    assert media.get_video_fps("8") == 8.0
+    assert media.get_video_fps("3") == 4.0
+    assert media.get_video_fps("fast") == 4.0
 
 
 def test_get_media_resolution() -> None:
@@ -63,7 +65,8 @@ def test_get_media_resolution() -> None:
 def test_clamp_fps_picks_nearest_allowed() -> None:
     assert media.clamp_fps(0.1) == 0.5
     assert media.clamp_fps(1.4) == 1.0
-    assert media.clamp_fps(10) == 2.0
+    assert media.clamp_fps(10) == 8.0
+    assert media.clamp_fps(30) == 16.0
 
 
 def test_youtube_url_becomes_video_file_data() -> None:
@@ -167,7 +170,7 @@ def test_client_supplied_fps_is_kept_and_clamped() -> None:
     assert _normalize(video_with_fps(2.0), fps=1.0) is None
     clamped = _normalize(video_with_fps(7.0), fps=1.0)
     assert clamped is not None
-    assert clamped.parts[0].video_metadata.fps == 2.0
+    assert clamped.parts[0].video_metadata.fps == 8.0
 
 
 def test_video_metadata_offsets_are_preserved() -> None:
@@ -186,7 +189,7 @@ def test_video_metadata_offsets_are_preserved() -> None:
     assert result is not None
     metadata = result.parts[0].video_metadata
     assert (metadata.fps, metadata.start_offset, metadata.end_offset) == (
-        2.0,
+        8.0,
         "10s",
         "40s",
     )
@@ -215,7 +218,10 @@ def test_real_graph_wires_the_video_branch() -> None:
     assert ("route_media", "video_reviewer", "video") in edges
     assert ("route_media", "_load_custom_rules", "mlr_review") in edges
     assert any(
-        src == "video_reviewer" and dst == "finalize_video_report"
+        src == "video_reviewer" and dst == "refine_video_boxes" for src, dst, _ in edges
+    )
+    assert any(
+        src == "refine_video_boxes" and dst == "finalize_video_report"
         for src, dst, _ in edges
     )
 
@@ -308,3 +314,69 @@ async def test_plain_text_takes_the_existing_branch() -> None:
     ):
         pass
     assert seen == {"mlr": True}
+
+
+def _user_event(*parts: types.Part):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(author="user", content=types.Content(role="user", parts=list(parts)))
+
+
+def _video_part(fps: float | None) -> types.Part:
+    return types.Part(
+        file_data=types.FileData(file_uri=YOUTUBE, mime_type="video/mp4"),
+        video_metadata=types.VideoMetadata(fps=fps) if fps else None,
+    )
+
+
+def test_sampling_fps_reads_newest_user_video() -> None:
+    events = [_user_event(_video_part(1.0)), _user_event(_video_part(2.0))]
+    assert media.sampling_fps(events) == 2.0
+    assert media.sampling_fps([_user_event(types.Part(text="hi"))]) is None
+    assert media.sampling_fps([]) is None
+
+
+@pytest.mark.parametrize(
+    ("fps", "fragments"),
+    [
+        (1.0, ["1 frame per second", "1 second apart", "multiple of 1 second"]),
+        (2.0, ["2 frames per second", "0.5 seconds apart", "multiple of 0.5 seconds"]),
+        (0.5, ["0.5 frames per second", "2 seconds apart", "multiple of 2 seconds"]),
+    ],
+)
+def test_sampling_note_describes_the_frame_spacing(fps, fragments) -> None:
+    note = media.sampling_note(fps)
+    for fragment in fragments:
+        assert fragment in note
+
+
+def test_video_instruction_uses_the_fps_on_the_message(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from app import prompts
+    from app.agent import _video_instruction
+
+    monkeypatch.setenv("VIDEO_FPS", "1")
+    ctx = SimpleNamespace(session=SimpleNamespace(events=[_user_event(_video_part(2.0))]))
+    text = _video_instruction(ctx)
+    assert text.startswith(prompts.VIDEO_REVIEWER)
+    assert "0.5 seconds apart" in text
+
+
+def test_video_instruction_falls_back_to_the_configured_fps(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from app.agent import _video_instruction
+
+    monkeypatch.setenv("VIDEO_FPS", "0.5")
+    ctx = SimpleNamespace(session=SimpleNamespace(events=[]))
+    assert "2 seconds apart" in _video_instruction(ctx)
+
+
+def test_video_agent_uses_a_dynamic_instruction_and_asks_for_null_boxes() -> None:
+    from app import prompts
+    from app.agent import video_reviewer
+
+    assert callable(video_reviewer.instruction)
+    assert "leave `bbox` null" in prompts.VIDEO_REVIEWER
+    assert "never box black" in prompts.VIDEO_REVIEWER

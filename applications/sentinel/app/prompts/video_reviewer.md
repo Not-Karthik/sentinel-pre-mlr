@@ -38,6 +38,8 @@ Return JSON conforming to the `VideoReport` schema.
 
 Set `location` for every finding that is tied to something visible in the frame (on-screen text, a logo, a chart, a product, a person, a graphic, a caption). Set `location` to null for findings that have no place in the frame (narration, background audio, missing captions, overall pacing).
 
+Only give a `bbox` when you can clearly see the item in the frame at `start_timestamp`. If the item is not visible at that moment, you are not confident where it is, or the frame is black or empty, leave `bbox` null (you may still describe the place in `section`) or set `location` to null. A missing box is better than a wrong one; never box black, blank or empty areas.
+
 When `location` is set:
 
 - `bbox`: a tight bounding box around the item exactly as it appears in the frame at `start_timestamp` (look at that frame, not an earlier or later one; the camera and the item may be moving), as four numbers `[x_min, y_min, x_max, y_max]`. Each number is a fraction of the frame between 0 and 1: x values are fractions of the frame width measured from the left edge, y values are fractions of the frame height measured from the top edge. `x_min` must be smaller than `x_max` and `y_min` smaller than `y_max`. Do not use pixel values and do not use a 0 to 1000 scale. Box the specific item, not the whole frame, unless the issue concerns the whole frame.
