@@ -201,7 +201,7 @@ Sentinel is configured for [Google Cloud Agent Runtime](https://docs.cloud.googl
 
 ### Direct Deployment via `agents-cli`
 
-You can deploy the agent directly using `agents-cli deploy`. The CLI packages the `app/` directory and generates deployment requirements:
+You can deploy the agent directly using `agents-cli deploy`. The CLI packages the `app/` directory and generates deployment requirements. It also merges the project-root `.env` into the engine's environment variables, which sends secrets such as `GEMINI_API_KEY` to the engine and fails on the reserved `GOOGLE_CLOUD_AGENT_ENGINE_*` names, so deploy from a copy of the project without `.env` and pass the variables you need with `--env-vars`. To update an existing engine, add `--update-only` and `--service-name` set to its display name:
 
 ```bash
 uv run agents-cli deploy \
@@ -255,12 +255,91 @@ Sentinel recovers an interrupted query from the events persisted in the session 
 
 - **Node retry:** every `LlmAgent` node retries up to `NODE_RETRY_ATTEMPTS` (default 3) on top of the HTTP-level `MODEL_RETRY_*` retries.
 - **Replay-based resume:** the app does not enable `ResumabilityConfig`, which would add a status-snapshot event after every node change. On resume the workflow replays the node outputs already saved in the session and re-runs only the unfinished nodes. An invocation counts as finished once a terminal node of the graph (`synthesizer` or `direct_responder`) has written its output. A node that was in flight when the process died runs again from its start (at-least-once).
-- **Resume call:** `POST /api/stream_reasoning_engine` with `{"class_method": "resume_stream_query", "input": {"user_id": "...", "session_id": "..."}}`. `invocation_id` is optional and defaults to the latest unfinished invocation. It returns an empty stream if that invocation already finished.
+- **Resume call:** `POST /api/stream_reasoning_engine` with `{"class_method": "resume_stream_query", "input": {"user_id": "...", "session_id": "..."}}`. `invocation_id` is optional and defaults to the latest unfinished invocation. It returns an empty stream if that invocation already finished. If the invocation's newest event is younger than `RESUME_MIN_IDLE_SECONDS` (default 600), the original run may still be going on the server, so the stream is a single `{"status": "invocation_in_progress", "retry_after_seconds": ...}` event instead of a second run; add `"force": true` to the input to skip that check.
 - **Server-side auto-resume:** when a query with a `user_id` and `session_id` fails while the container is alive, the server resumes it inside the same stream, up to `AUTO_RESUME_MAX` times (default 3, `0` disables) with backoff from `AUTO_RESUME_INITIAL_DELAY` to `AUTO_RESUME_MAX_DELAY`.
-- **When resumes run out:** the stream ends with a final JSON line `{"error_code", "error_message", "resumable", "invocation_id", "session_id", "user_id"}`. If `resumable` is true, a UI Retry button should call `resume_stream_query` with the same `user_id` and `session_id`. That call gets a fresh automatic-resume budget. If `resumable` is false, nothing was saved, so re-send the original query.
-- **Automatic retry (client side):** `app/app_utils/resilient_client.py` (`stream_query_with_resume`) sends the query and, on a dropped stream or an error event, resumes the same session with exponential backoff up to `max_resumes`.
+- **When resumes run out:** the stream ends with a final JSON line `{"error_code", "error_message", "resumable", "invocation_id", "session_id", "user_id"}`. If `resumable` is true, a UI Retry button should call `resume_stream_query` with the same `user_id` and `session_id` and `"force": true` (the server's own run has ended). That call gets a fresh automatic-resume budget. If `resumable` is false, nothing was saved, so re-send the original query.
+- **Automatic retry (client side):** `app/app_utils/resilient_client.py` (`stream_query_with_resume`) sends the query and, on a dropped stream or an error event, resumes the same session with exponential backoff up to `max_resumes`. If a resume answers `invocation_in_progress` it polls (every 15 s, up to 25 minutes) instead of starting a second run, and if the invocation turns out to be finished it reads the missing events from the session.
 
 Long-running tasks (`:asyncQuery` with GCS input and output) are not covered yet.
+
+## Passing Images and Videos by `gs://` URL
+
+An image or a video is passed to the deployed agent by reference: the file sits in the media bucket and the request carries its `gs://` URI. The input is the same for both; the agent picks the flow from the file type.
+
+### Request
+
+1. Create a session for the user (the engine generates the session id):
+
+```
+POST https://us-central1-aiplatform.googleapis.com/v1/projects/<project>/locations/us-central1/reasoningEngines/<engine_id>:query
+{"classMethod": "async_create_session", "input": {"user_id": "<user>"}}
+-> {"output": {"id": "<session_id>", "user_id": "<user>", "events": [], "state": {}}}
+```
+
+2. Run the review and read the streamed events (one JSON event per line):
+
+```
+POST https://us-central1-aiplatform.googleapis.com/v1/projects/<project>/locations/us-central1/reasoningEngines/<engine_id>:streamQuery?alt=sse
+{"classMethod": "async_stream_query",
+ "input": {"user_id": "<user>", "session_id": "<session_id>",
+           "message": "Review gs://<bucket>/<folder>/<file>"}}
+```
+
+Both calls need `Authorization: Bearer <token>` and `Content-Type: application/json`. The caller needs permission to call the engine; it does not need access to the bucket. Sessions belong to a `user_id`, so a session is only listed for the user that created it. The runs below used the `v1beta1` URL; `v1` takes the same body but was not tried.
+
+### What the agent does with the URI
+
+- `MediaInputPlugin` (`app/app_utils/media.py`) runs before the workflow. It finds each `gs://` URL in the message text and appends a `file_data` part with a mime type taken from the file extension: `jpg`, `jpeg`, `png`, `webp`, `gif` for images; `mp4`, `mpeg`, `mpg`, `mov`, `avi`, `wmv`, `webm` for video. A `gs://` URL with another extension stays plain text. Up to 10 media items per message.
+- Each URL must start with `gs://<GCS_BUCKET_NAME>/<GCS_MEDIA_FOLDER>/` (for example `gs://pre-mlr-bucket-001/dev/`); URLs with `..`, a backslash or a NUL character, or outside that folder, are rejected before any model call.
+- `route_media` sends a message with a video part to the video flow (4 fps, then pass 2 for boxes) and anything else to the image flow (intake, reviewer panel, critics, synthesizer).
+- The model reads the object from Cloud Storage itself. Video pass 2 downloads the object with the agent identity to cut still frames, so that identity needs `roles/storage.objectViewer` on the media bucket.
+
+### Response
+
+The final event carries the report in its `output`; read the events in order and take the last one whose `node_info.path` ends in the final node:
+
+| | Image | Video |
+|---|---|---|
+| Final node | `synthesizer` | `finalize_video_report` |
+| Report | `FinalReport` | `VideoReport` |
+| Findings | `Finding`, with `location.section` and `location.bbox` | `VideoFinding`, the same fields plus `start_timestamp` and `end_timestamp` |
+| Checked in code | no | boxes and time ranges validated, severity counts recomputed |
+
+The two reports share `finding_id`, `category`, `severity`, `observation` and `location`, but there is no field saying which kind of report it is, and the `category` values differ. In the one image run, `counts_by_severity` came back empty.
+
+### What has been run
+
+| Input | Where | Result |
+|---|---|---|
+| 8 s and 61 s MP4 by `gs://` URL | deployed engine | worked; 78 s and 148 s |
+| One JPG by `gs://` URL | deployed engine | worked; 465.8 s, 22 model calls, about $0.64 |
+| GIF, `fileData` message parts, a `session_id` not created first, files over a few minutes or tens of MB | not run | unknown |
+
+Single runs; see `docs/video-analysis-adk.md` for the video measurements.
+
+### Intended UI flow
+
+1. The user picks an image or a video in the UI.
+2. The UI backend uploads it to the media bucket. `POST /api/v1/storage/upload` already does this: it accepts the image and video types listed above, writes `gs://<bucket>/<folder>/<safe name>` and returns the `uri`.
+3. The backend creates a session for the signed-in user and calls `:streamQuery` with that `uri` in the message, relaying the events to the browser.
+4. The UI shows progress from the events and, from the final event, the findings: a timestamp that seeks the player and a box drawn over the frame for video; a box over the image for images (`location.bbox` is `[x_min, y_min, x_max, y_max]`, fractions of the width and height).
+5. If the stream drops, the backend resumes the same `session_id` (see Retry & Resume) instead of sending the query again.
+
+The browser should not call the engine directly: keep the engine credentials in the backend.
+
+### Before production
+
+Not done yet unless marked:
+
+- **Check every media part, not only text.** The allow-list covers `gs://` URLs found in message text; a structured `fileData` part skips it, so a caller could point the model at any object it can name. Validate all media parts the same way.
+- **Ownership.** All uploads share one folder, so any caller can reference any object in it. Store each user's or tenant's files under their own prefix and check the prefix against the caller before running a review.
+- **Check the object, not only the name.** The mime type comes from the extension. Check that the object exists, its content type, size and (for video) duration, and return a clear error to the caller. Limits for large videos are untested.
+- **Narrow the bucket grant.** The agent identity has `roles/storage.objectViewer` on the whole bucket; an IAM condition can limit it to the media prefix.
+- **Authenticate the backend.** Call the engine from a service account with the role to use the engine, behind your own user authentication; do not hand out engine tokens to browsers.
+- **Retention.** Decide how long uploaded media and sessions are kept and delete them after the review; test sessions and test files from this work are still in the project.
+- **Make the two reports consistent.** Add a `media_type` field, validate and recount image reports as video reports already are, and agree one finding shape with the frontend.
+- **Time and cost.** An image review took about 8 minutes and a 61 s video about 2.5 minutes in the runs above. The UI needs a progress display and a long-request timeout, and the project quota needs room for parallel reviews (rate-limit errors appeared when two runs overlapped).
+- **Concurrent resumes.** A resume is refused while the run may still be going (`RESUME_MIN_IDLE_SECONDS`); a resume after a real container crash is not tested.
 
 ## A2A (Agent-to-Agent) Integration & Multi-Agent Workflows
 

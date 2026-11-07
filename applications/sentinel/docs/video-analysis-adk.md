@@ -22,6 +22,45 @@ START
 - **`finalize_video_report`** (`app/app_utils/video_report.py`) checks every bbox (length 4, 0..1, ordered, not degenerate), rescales a 0..1000 box, drops unusable ones, swaps an inverted time range, and recomputes `counts_by_severity`.
 - **`UsageLoggingPlugin`** (`app/app_utils/usage.py`) logs `usage_metadata` per model call (prompt, video/audio/text details, candidates, thoughts).
 
+## Flow from input to final report
+
+```
+user message (text with a gs:// or YouTube URL, or an attached video)
+  -> MediaInputPlugin     before the workflow starts:
+                          - turns the URL into a file_data part (mime from the extension)
+                          - checks gs:// against gs://<bucket>/<folder>/
+                          - sets video_metadata.fps = 4 on every video part
+  -> route_media          video part present -> video branch, else the image/text flow
+  -> PASS 1: video_reviewer (one LlmAgent call)
+        sees: the whole video at 4 fps, media_resolution HIGH, plus its audio
+        prompt: video_reviewer.md plus a note saying how far apart the frames are
+        returns VideoReport: 20-40 findings, each with
+          category, severity, observation, quoted_content, start/end timestamp,
+          and optionally location {section, bbox} (a first-guess box)
+  -> PASS 2: refine_video_boxes (a function node; runs if VIDEO_BBOX_REFINE=true)
+        1. find the video in the session (gs:// object or attached bytes)
+           and download it to a temp folder (cap VIDEO_REFINE_MAX_MB, default 500)
+        2. take findings that have a box and group them by start time (to 0.1 s)
+        3. for each group, cut stills at start -0.5, 0, +0.5, +1.0 s with ffmpeg
+        4. one model call per group, sending up to 4 stills plus the findings' text;
+           the model returns the earliest frame where each item is clearly visible
+           and a tight box on that frame
+        5. replace the box and move start_timestamp to that frame
+        6. delete the temp folder
+  -> finalize_video_report   validates boxes and times, recounts severities
+  -> output, with the events stored in the session
+```
+
+If pass 2 is off, or the video cannot be read, pass 1's report goes straight to `finalize_video_report`. YouTube links always take that path.
+
+### How many LLM calls
+
+- **Pass 1:** 1 call (`video_reviewer`). The node retries up to 3 times on an error; no retry occurred in the runs below.
+- **Pass 2:** one call per distinct start time (to 0.1 s) among findings that have a box. That is not one call per finding, and no still is sent twice. They are direct model calls, not agents, with thinking level low and at most 3 running at once (`VIDEO_REFINE_CONCURRENCY`).
+- **Measured locally:** 8 s clip, 9 calls for 16 boxed findings (24 stills); 61 s ad, 14 calls for 15 boxed findings (52 stills).
+- **Deployed runs (inferred):** 12 calls for the 8 s clip (15 boxed findings) and 20 for the 61 s ad (20 boxed findings), counted from the distinct start times in the pass-1 report. The engine's INFO log line was not visible, so these were not confirmed.
+- **Total:** about 1 + N calls per run, where N is at most the number of boxed findings (at most 40).
+
 ## Why two passes, and how they work
 
 **The problem with one pass.** Pass 1 sends the whole video to the model once. At 4 fps and HIGH resolution each sampled frame costs about 264 tokens, which is enough to decide what is said and shown and when, but not enough to place a box precisely: small text and UI elements are boxed coarsely, and the model tends to report a start time slightly before the item is clearly visible, so the box can fit a frame a moment later. Single-pass boxes were wrong or loose in many findings (see "Why bbox are approximate").
@@ -300,6 +339,39 @@ Single runs on the `gs://` copies, no retries or rate-limit errors. "On target" 
 
 The overlay-relevant parts (`finding_id`, `severity`, `observation`, `location.bbox`) are the same, so one bbox overlay component can serve both. The frontend's current viewer types (`frontend/src/viewer/types.ts`) mark `review_lens`, `category`, `confidence`, `confidence_band`, `evidence_depth`, `mlr_principle` and `discussion` as required, so a strictly typed renderer needs them optional or a separate video type. The report has no `media_type` field yet; adding one would let a client choose the renderer.
 
+## Deployed engine test (Agent Runtime, 2026-11-05)
+
+Deployed with `agents-cli deploy --update-only --service-name="Sentinel Agent"` to the existing engine 6707271892962639872 (project `pre-mlr`, `us-central1`), passing `GCS_BUCKET_NAME`, `GCS_MEDIA_FOLDER`, `VIDEO_FPS=4`, `VIDEO_MEDIA_RESOLUTION=HIGH`, `VIDEO_BBOX_REFINE=true`, `VIDEO_REFINE_CONCURRENCY=3` and `VIDEO_REFINE_MAX_MB=500`. Checked afterwards: the engine kept its 14 existing variables and gained these 7.
+
+Deployment notes [Measured]:
+- `agents-cli deploy` merges the project-root `.env` into the engine's environment, and the engine rejects the reserved `GOOGLE_CLOUD_AGENT_ENGINE_*` names with a 400. Deploy from a copy of the project without `.env` so secrets such as `GEMINI_API_KEY` are not sent.
+- The engine is found by its display name, so `--service-name="Sentinel Agent"` is required, and a `Dockerfile` must be in the project root.
+- Pass 2 downloads the video with the agent identity, which first got a 403 (`storage.objects.get` denied) on the bucket. Granting that identity `roles/storage.objectViewer` on the media bucket fixed it. Pass 1 needed no grant: the model read the `gs://` video with the same input tokens as locally.
+
+Results (4 fps, `gs://` video, one run each, no errors). Boxes on target is my reading of the screenshots in `deployed-4fps-*.png`:
+
+| | 8 s clip | 61 s ad |
+|---|---|---|
+| Total time (same video locally) | 78.4 s (140.3 s) | 147.9 s (191.5 s) |
+| Pass 1 tokens, in / out | 10,685 / 3,155 | 67,717 / 5,235 |
+| Findings, with a box | 21, 15 | 26, 20 |
+| Pass 2 effect | all 15 boxes replaced, 4 start times moved | 19 of 20 boxes replaced, 13 start times moved |
+| Boxes on target | 14 of 15 | 17 of 20 |
+
+Sessions [Measured]:
+- `async_create_session` works. After a query the session holds 5 events: the user message (the `gs://` link converted to a `file_data` part), `route_media`, `video_reviewer`, `refine_video_boxes` and `finalize_video_report`. `async_get_session` and `async_list_sessions` return it.
+- `resume_stream_query` on a finished query returns an empty stream.
+- After cutting the client at 30 s (pass 1 already saved), `resume_stream_query` returned only the pass 2 and finalize events; `video_reviewer` ran once, so pass 1 was not repeated.
+- The server keeps running a query after the client disconnects. In that test the session ended with pass 2 and finalize recorded twice, 2 min 47 s apart. Engine logs show two pass 2 executions starting 5 s apart: the original run (still going after the client was cut) and the resume, which was called 33 s in. `find_unfinished_invocation_id` (`app/app_utils/resume.py`) treats any invocation without a terminal output as interrupted and does not check whether it is still running, so it resumed the same invocation a second time. The duplicate is therefore caused by resuming while the original run was alive, not by a crash. A resume after the original has really died (container crash) has not been tested. A client that resumes after a dropped stream (`resilient_client.py` waited 2 s first) could hit the same case, and a duplicate costs pass 2 twice.
+
+Fix (deployed to the engine on 2026-11-05 and tested there on the video flow; it applies to the video and image flows because it reads the terminal nodes from the graph, but the image flow was only covered by unit tests): `resume_stream_query` now answers a single `{"status": "invocation_in_progress", "retry_after_seconds": ...}` event instead of resuming when the invocation's newest event is younger than `RESUME_MIN_IDLE_SECONDS` (default 600 s). `"force": true` skips the check; the server's own automatic resume and a retry after a `resumable` failure event use it. `resilient_client.py` polls on that status instead of starting a second run, and reads the stored events of the invocation from the session if it turns out to have finished. This is a time threshold, not a lease: a silent step longer than the threshold can still be resumed twice, and a real crash is only resumed after the threshold unless the caller forces it.
+
+Retest on the deployed engine (8 s clip, fresh session, client cut at 41 s after pass 1 was saved) [Measured]: five `resume_stream_query` calls without `force`, 20 s apart. The first four each returned one `invocation_in_progress` event (the reported idle time grew from 44.5 s to 112.5 s) and ran nothing. The fifth, at 137 s, returned nothing because the original run had finished. The session ended with 5 events and three outputs containing findings (pass 1, pass 2, finalize), against 7 events and pass 2 run twice in the earlier test. The idle time is counted from the newest event's timestamp, and that timestamp looks like the node's start rather than its end (idle was 44.5 s at 47 s into a run whose pass 1 ended at about 41 s), so the idle figure overstates how long a step has been silent.
+
+Seen in the engine logs of that test: `ffmpeg failed at 8.000s` and `8.500s` (candidate frames past the end of the 8 s clip; harmless, the frame is skipped), and one `Box refinement failed for frames at 4.0s: 429 RESOURCE_EXHAUSTED` while the two pass 2 executions overlapped, so that group kept its pass-1 boxes.
+
+Not measured: pass 2 tokens and cost on the deployed engine, a container crash with automatic resume, and the 401 warnings about the `pre-mlr-sentinel-agent-logs` bucket seen in the engine logs (not checked whether they predate this deploy).
+
 ## Tests
 
 `tests/unit/test_media_input.py` (URL conversion, allow-list, fps clamping, routing, plugin + router through an in-memory runner), `tests/unit/test_video_report.py` (schemas, bbox/time-range validation, final node, usage formatting), plus the updated terminal-node assertion in `tests/unit/test_resume.py`.
@@ -307,7 +379,7 @@ The overlay-relevant parts (`finding_id`, `severity`, `observation`, `location.b
 
 ## Open items
 
-- Deployed engine: not tested. Check that `App(plugins=...)` is honoured by the Agent Runtime wrapper, that `file_data` survives `stream_query`, and that the Agent Runtime identity can read the media bucket.
+- Deployed engine: tested on 8 s and 61 s (see "Deployed engine test"). Still open: a resume after a real container crash (the guard retest above used a cut client, not a dead container), pass 2 token and cost on the engine, and the same bucket read grant for any other environment.
 - Agent Runtime request duration and payload limits for long videos.
 - A video longer than a few minutes has not been run. At 1 fps HIGH, input is about 289 tokens per second of video (about 53k for 3 minutes, extrapolated); the model's input limit is 1,048,576 tokens.
 - Prompt asks for 20-40 findings, which is a lot for an 8 s clip; tune after the vendor reviews real output.

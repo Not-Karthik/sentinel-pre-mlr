@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 AUTO_RESUME_MAX = int(os.getenv("AUTO_RESUME_MAX", "3"))
 AUTO_RESUME_INITIAL_DELAY = float(os.getenv("AUTO_RESUME_INITIAL_DELAY", "2.0"))
 AUTO_RESUME_MAX_DELAY = float(os.getenv("AUTO_RESUME_MAX_DELAY", "60.0"))
+RESUME_MIN_IDLE_SECONDS = float(os.getenv("RESUME_MIN_IDLE_SECONDS", "600"))
+IN_PROGRESS_STATUS = "invocation_in_progress"
 
 
 def _terminal_node_names(agent: Any) -> set[str]:
@@ -83,16 +86,41 @@ async def find_unfinished_invocation_id(
     return order[-1]
 
 
+async def invocation_idle_seconds(
+    runner: Runner, user_id: str, session_id: str, invocation_id: str
+) -> float | None:
+    """Seconds since the newest persisted event of an invocation, if any."""
+    session = await runner.session_service.get_session(
+        app_name=runner.app_name, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        return None
+    stamps = [
+        event.timestamp
+        for event in session.events
+        if event.invocation_id == invocation_id and event.timestamp
+    ]
+    return max(0.0, time.time() - max(stamps)) if stamps else None
+
+
 async def resume_stream_query(
     runner: Runner,
     *,
     user_id: str,
     session_id: str,
     invocation_id: str | None = None,
+    force: bool = False,
+    min_idle_seconds: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream the remaining events of an interrupted invocation.
 
-    Yields nothing when the latest invocation already completed.
+    Yields nothing when the latest invocation already completed. An unfinished
+    invocation whose newest event is younger than ``min_idle_seconds`` (default
+    ``RESUME_MIN_IDLE_SECONDS``) may still be running on another request, so a
+    single ``invocation_in_progress`` event is yielded instead of starting a
+    second run. ``force=True`` skips that check for callers that know the run
+    is dead, such as the automatic resume and a retry after a ``resumable``
+    failure event.
     """
     if invocation_id is None:
         invocation_id = await find_unfinished_invocation_id(
@@ -100,6 +128,22 @@ async def resume_stream_query(
         )
     if invocation_id is None:
         return
+
+    window = RESUME_MIN_IDLE_SECONDS if min_idle_seconds is None else min_idle_seconds
+    if not force and window > 0:
+        idle = await invocation_idle_seconds(
+            runner, user_id, session_id, invocation_id
+        )
+        if idle is not None and idle < window:
+            yield {
+                "status": IN_PROGRESS_STATUS,
+                "invocation_id": invocation_id,
+                "session_id": session_id,
+                "user_id": user_id,
+                "idle_seconds": round(idle, 1),
+                "retry_after_seconds": round(window - idle, 1),
+            }
+            return
 
     async for event in runner.run_async(
         user_id=user_id, session_id=session_id, invocation_id=invocation_id
@@ -154,6 +198,7 @@ async def with_auto_resume(
                 user_id=user_id,
                 session_id=session_id,
                 invocation_id=invocation_id,
+                force=True,
             )
 
 
